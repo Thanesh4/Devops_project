@@ -1,0 +1,237 @@
+name: Backend Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'starter/backend/**'
+      - '.github/workflows/backend-cd.yaml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: cluster
+  KUSTOMIZE_VERSION: 5.0.0
+  PYTHON_VERSION: '3.10'
+
+concurrency:
+  group: backend-deployment-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pre-deployment-validation:
+    runs-on: ubuntu-22.04
+    name: Pre-Deployment Validation
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python Runtime
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pipenv'
+
+      - name: Install Pipenv Package Manager
+        run: pip install --upgrade pipenv
+
+      - name: Install Project Dependencies
+        working-directory: starter/backend
+        run: pipenv install --dev --deploy
+
+      - name: Run Linting Checks
+        working-directory: starter/backend
+        run: pipenv run lint
+
+      - name: Execute Test Suite
+        working-directory: starter/backend
+        run: pipenv run test
+        env:
+          FLASK_ENV: testing
+          PYTHONDONTWRITEBYTECODE: 1
+
+  build-and-push:
+    runs-on: ubuntu-22.04
+    name: Build & Push to ECR
+    needs: pre-deployment-validation
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image-uri: ${{ steps.ecr-metadata.outputs.image-uri }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: private
+
+      - name: Extract ECR Repository URI
+        id: ecr-metadata
+        run: |
+          ECR_REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          ECR_REPOSITORY="movie-backend"
+          IMAGE_TAG="${{ github.sha }}"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "image-uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "registry=${ECR_REGISTRY}" >> $GITHUB_OUTPUT
+          echo "repository=${ECR_REPOSITORY}" >> $GITHUB_OUTPUT
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Backend Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: starter/backend
+          file: starter/backend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr-metadata.outputs.image-uri }}
+            ${{ steps.ecr-login.outputs.registry }}/movie-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Verify ECR Image Push
+        run: |
+          aws ecr describe-images \
+            --repository-name movie-backend \
+            --region ${{ env.AWS_REGION }} \
+            --image-ids imageTag=${{ github.sha }}
+
+  deploy-to-eks:
+    runs-on: ubuntu-22.04
+    name: Deploy to EKS
+    needs: build-and-push
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --kubeconfig ${{ runner.temp }}/kubeconfig
+          chmod 600 ${{ runner.temp }}/kubeconfig
+          echo "KUBECONFIG=${{ runner.temp }}/kubeconfig" >> $GITHUB_ENV
+
+      - name: Install Kustomize
+        run: |
+          mkdir -p /tmp/kustomize
+          curl -sSLo /tmp/kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz
+          tar xzf /tmp/kustomize.tar.gz -C /tmp/kustomize/
+          echo "/tmp/kustomize" >> $GITHUB_PATH
+
+      - name: Verify Kubernetes Connectivity
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create or Update Application Namespace
+        run: |
+          kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Update Backend Image Tag in Kustomize
+        working-directory: starter/backend/k8s
+        run: |
+          kustomize edit set image \
+            backend=${{ needs.build-and-push.outputs.image-uri }}
+
+      - name: Generate and Apply Kubernetes Manifests
+        working-directory: starter/backend/k8s
+        run: |
+          kustomize build . | kubectl apply -n production -f -
+          echo "✅ Backend manifests applied successfully."
+
+      - name: Wait for Deployment Rollout
+        run: |
+          kubectl rollout status deployment/backend \
+            --namespace production \
+            --timeout=5m
+
+      - name: Verify Backend Service Availability
+        run: |
+          kubectl get service backend -n production -o wide
+          kubectl get deployment backend -n production -o wide
+          kubectl get pods -n production -l app=backend
+
+      - name: Capture Deployment Summary
+        if: always()
+        run: |
+          echo "=== Backend Deployment Summary ===" | tee -a $GITHUB_STEP_SUMMARY
+          echo "Image URI: ${{ needs.build-and-push.outputs.image-uri }}" | tee -a $GITHUB_STEP_SUMMARY
+          echo "Commit SHA: ${{ github.sha }}" | tee -a $GITHUB_STEP_SUMMARY
+          echo "Deployed at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" | tee -a $GITHUB_STEP_SUMMARY
+          echo "" | tee -a $GITHUB_STEP_SUMMARY
+          kubectl describe deployment backend -n production | tee -a $GITHUB_STEP_SUMMARY
+
+  post-deployment-tests:
+    runs-on: ubuntu-22.04
+    name: Post-Deployment Health Checks
+    needs: deploy-to-eks
+    if: always()
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --kubeconfig ${{ runner.temp }}/kubeconfig
+          echo "KUBECONFIG=${{ runner.temp }}/kubeconfig" >> $GITHUB_ENV
+
+      - name: Check Pod Health Status
+        run: |
+          echo "Checking backend pods..."
+          kubectl get pods -n production -l app=backend
+          READY_PODS=$(kubectl get pods -n production -l app=backend -o json | jq '[.items[] | select(.status.conditions[] | select(.type=="Ready" and .status=="True"))] | length')
+          echo "Ready pods: ${READY_PODS}"
+          if [ "$READY_PODS" -lt 1 ]; then
+            echo "⚠️  No ready backend pods detected."
+            kubectl describe pods -n production -l app=backend
+            exit 1
+          fi
+
+      - name: Verify Container Logs
+        run: |
+          kubectl logs -n production -l app=backend --tail=50 --timestamps=true
+
+      - name: Document Deployment Success
+        run: |
+          echo "✅ Backend deployment completed successfully at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
