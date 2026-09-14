@@ -1,0 +1,237 @@
+name: Frontend Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'starter/frontend/**'
+      - '.github/workflows/frontend-cd.yaml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: cluster
+  KUSTOMIZE_VERSION: 5.0.0
+
+concurrency:
+  group: frontend-deployment-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pre-deployment-validation:
+    runs-on: ubuntu-22.04
+    name: Pre-Deployment Validation
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'starter/frontend/package-lock.json'
+
+      - name: Install Dependencies
+        working-directory: starter/frontend
+        run: npm ci --legacy-peer-deps
+        env:
+          NPM_CONFIG_LEGACY_PEER_DEPS: true
+
+      - name: Lint Codebase
+        working-directory: starter/frontend
+        run: npm run lint
+
+      - name: Execute Test Suite
+        working-directory: starter/frontend
+        run: CI=true npm test -- --coverage --watchAll=false
+        env:
+          CI: true
+
+  build-and-push:
+    runs-on: ubuntu-22.04
+    name: Build & Push to ECR
+    needs: pre-deployment-validation
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image-uri: ${{ steps.ecr-metadata.outputs.image-uri }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: private
+
+      - name: Extract ECR Repository URI
+        id: ecr-metadata
+        run: |
+          ECR_REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          ECR_REPOSITORY="movie-frontend"
+          IMAGE_TAG="${{ github.sha }}"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "image-uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "registry=${ECR_REGISTRY}" >> $GITHUB_OUTPUT
+          echo "repository=${ECR_REPOSITORY}" >> $GITHUB_OUTPUT
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Frontend Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: starter/frontend
+          file: starter/frontend/Dockerfile
+          push: true
+          build-args: |
+            REACT_APP_MOVIE_API_URL=${{ secrets.REACT_APP_MOVIE_API_URL || 'http://localhost:5000' }}
+          tags: |
+            ${{ steps.ecr-metadata.outputs.image-uri }}
+            ${{ steps.ecr-login.outputs.registry }}/movie-frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Verify ECR Image Push
+        run: |
+          aws ecr describe-images \
+            --repository-name movie-frontend \
+            --region ${{ env.AWS_REGION }} \
+            --image-ids imageTag=${{ github.sha }}
+
+  deploy-to-eks:
+    runs-on: ubuntu-22.04
+    name: Deploy to EKS
+    needs: build-and-push
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --kubeconfig ${{ runner.temp }}/kubeconfig
+          chmod 600 ${{ runner.temp }}/kubeconfig
+          echo "KUBECONFIG=${{ runner.temp }}/kubeconfig" >> $GITHUB_ENV
+
+      - name: Install Kustomize
+        run: |
+          mkdir -p /tmp/kustomize
+          curl -sSLo /tmp/kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz
+          tar xzf /tmp/kustomize.tar.gz -C /tmp/kustomize/
+          echo "/tmp/kustomize" >> $GITHUB_PATH
+
+      - name: Verify Kubernetes Connectivity
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create or Update Application Namespace
+        run: |
+          kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Update Frontend Image Tag in Kustomize
+        working-directory: starter/frontend/k8s
+        run: |
+          kustomize edit set image \
+            frontend=${{ needs.build-and-push.outputs.image-uri }}
+
+      - name: Generate and Apply Kubernetes Manifests
+        working-directory: starter/frontend/k8s
+        run: |
+          kustomize build . | kubectl apply -n production -f -
+          echo "✅ Frontend manifests applied successfully."
+
+      - name: Wait for Deployment Rollout
+        run: |
+          kubectl rollout status deployment/frontend \
+            --namespace production \
+            --timeout=5m
+
+      - name: Verify Frontend Service Availability
+        run: |
+          kubectl get service frontend -n production -o wide
+          kubectl get deployment frontend -n production -o wide
+          kubectl get pods -n production -l app=frontend
+
+      - name: Capture Deployment Summary
+        if: always()
+        run: |
+          echo "=== Deployment Summary ===" | tee -a $GITHUB_STEP_SUMMARY
+          echo "Image URI: ${{ needs.build-and-push.outputs.image-uri }}" | tee -a $GITHUB_STEP_SUMMARY
+          echo "Commit SHA: ${{ github.sha }}" | tee -a $GITHUB_STEP_SUMMARY
+          echo "Deployed at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" | tee -a $GITHUB_STEP_SUMMARY
+          echo "" | tee -a $GITHUB_STEP_SUMMARY
+          kubectl describe deployment frontend -n production | tee -a $GITHUB_STEP_SUMMARY
+
+  post-deployment-tests:
+    runs-on: ubuntu-22.04
+    name: Post-Deployment Health Checks
+    needs: deploy-to-eks
+    if: always()
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --kubeconfig ${{ runner.temp }}/kubeconfig
+          echo "KUBECONFIG=${{ runner.temp }}/kubeconfig" >> $GITHUB_ENV
+
+      - name: Check Pod Health Status
+        run: |
+          echo "Checking frontend pods..."
+          kubectl get pods -n production -l app=frontend
+          READY_PODS=$(kubectl get pods -n production -l app=frontend -o json | jq '[.items[] | select(.status.conditions[] | select(.type=="Ready" and .status=="True"))] | length')
+          echo "Ready pods: ${READY_PODS}"
+          if [ "$READY_PODS" -lt 1 ]; then
+            echo "⚠️  No ready frontend pods detected."
+            kubectl describe pods -n production -l app=frontend
+            exit 1
+          fi
+
+      - name: Verify Container Logs
+        run: |
+          kubectl logs -n production -l app=frontend --tail=50 --timestamps=true
+
+      - name: Document Deployment Success
+        run: |
+          echo "✅ Frontend deployment completed successfully at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
