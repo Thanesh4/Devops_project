@@ -1,0 +1,132 @@
+name: Frontend Continuous Integration
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'starter/frontend/**'
+      - '.github/workflows/frontend-ci.yaml'
+  workflow_dispatch:
+
+env:
+  NODE_ENV: test
+  SKIP_PREFLIGHT_CHECK: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    name: Lint Frontend Code
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'starter/frontend/package-lock.json'
+
+      - name: Install Dependencies
+        working-directory: starter/frontend
+        run: npm ci --legacy-peer-deps
+        env:
+          NPM_CONFIG_LEGACY_PEER_DEPS: true
+
+      - name: Run ESLint
+        working-directory: starter/frontend
+        run: npm run lint
+        continue-on-error: false
+
+  test:
+    runs-on: ubuntu-22.04
+    name: Test Frontend Application
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'starter/frontend/package-lock.json'
+
+      - name: Install Dependencies
+        working-directory: starter/frontend
+        run: npm ci --legacy-peer-deps
+        env:
+          NPM_CONFIG_LEGACY_PEER_DEPS: true
+
+      - name: Execute Unit Tests
+        working-directory: starter/frontend
+        run: CI=true npm test -- --coverage --watchAll=false
+        env:
+          CI: true
+
+      - name: Upload Coverage Reports
+        uses: codecov/codecov-action@v3
+        if: always()
+        with:
+          files: './starter/frontend/coverage/coverage-final.json'
+          fail_ci_if_error: false
+          verbose: true
+
+  build:
+    runs-on: ubuntu-22.04
+    name: Build Frontend Docker Image
+    needs: [lint, test]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate Dockerfile Syntax
+        run: |
+          docker run --rm -i hadolint/hadolint < starter/frontend/Dockerfile || true
+
+      - name: Build Frontend Image (No Push)
+        uses: docker/build-push-action@v5
+        with:
+          context: starter/frontend
+          file: starter/frontend/Dockerfile
+          push: false
+          load: true
+          build-args: |
+            REACT_APP_MOVIE_API_URL=http://localhost:5000
+          tags: |
+            frontend:${{ github.sha }}
+            frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Inspect Image Layers
+        run: |
+          docker image inspect frontend:${{ github.sha }} || true
+
+  quality-gate:
+    runs-on: ubuntu-22.04
+    name: Frontend Quality Gate
+    needs: [lint, test, build]
+    if: always()
+    steps:
+      - name: Evaluate CI Pipeline Status
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.build.result }}" != "success" ]]; then
+            echo "❌ Frontend CI pipeline failed. Review logs above."
+            exit 1
+          fi
+          echo "✅ All frontend CI checks passed."
