@@ -3,4 +3,4 @@ kind: Kustomization
 resources:
   - service.yaml
   - deployment.yaml
-namespace: default
+namespace: production
