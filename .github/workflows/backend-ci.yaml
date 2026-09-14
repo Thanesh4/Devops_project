@@ -1,0 +1,141 @@
+name: Backend Continuous Integration
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'starter/backend/**'
+      - '.github/workflows/backend-ci.yaml'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    name: Lint Backend Code
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python Runtime
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pipenv'
+
+      - name: Install Pipenv Package Manager
+        run: pip install --upgrade pipenv
+
+      - name: Install Project Dependencies
+        working-directory: starter/backend
+        run: pipenv install --dev --deploy
+
+      - name: Run Linting Checks (Flake8 / Pylint)
+        working-directory: starter/backend
+        run: pipenv run lint
+        continue-on-error: false
+
+  test:
+    runs-on: ubuntu-22.04
+    name: Test Backend Application
+    strategy:
+      matrix:
+        python-version: ['3.10']
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python Runtime
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pipenv'
+
+      - name: Install Pipenv Package Manager
+        run: pip install --upgrade pipenv
+
+      - name: Install Project Dependencies
+        working-directory: starter/backend
+        run: pipenv install --dev --deploy
+
+      - name: Execute Unit Test Suite
+        working-directory: starter/backend
+        run: pipenv run test
+        env:
+          FLASK_ENV: testing
+          PYTHONDONTWRITEBYTECODE: 1
+
+      - name: Generate Coverage Report
+        working-directory: starter/backend
+        run: pipenv run test -- --cov=. --cov-report=xml --cov-report=html
+        continue-on-error: true
+
+      - name: Upload Coverage Metrics
+        uses: codecov/codecov-action@v3
+        if: always()
+        with:
+          files: './starter/backend/coverage.xml'
+          flags: backend
+          name: backend-coverage
+          fail_ci_if_error: false
+          verbose: true
+
+  build:
+    runs-on: ubuntu-22.04
+    name: Build Backend Docker Image
+    needs: [lint, test]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate Dockerfile Syntax
+        run: |
+          docker run --rm -i hadolint/hadolint < starter/backend/Dockerfile || true
+
+      - name: Build Backend Image (No Push)
+        uses: docker/build-push-action@v5
+        with:
+          context: starter/backend
+          file: starter/backend/Dockerfile
+          push: false
+          load: true
+          tags: |
+            backend:${{ github.sha }}
+            backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Inspect Docker Image Configuration
+        run: |
+          docker image inspect backend:${{ github.sha }} || true
+          docker run --rm backend:${{ github.sha }} python --version
+
+  quality-gate:
+    runs-on: ubuntu-22.04
+    name: Backend Quality Gate
+    needs: [lint, test, build]
+    if: always()
+    steps:
+      - name: Evaluate CI Pipeline Status
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.build.result }}" != "success" ]]; then
+            echo "❌ Backend CI pipeline failed. Review logs above."
+            exit 1
+          fi
+          echo "✅ All backend CI checks passed."
