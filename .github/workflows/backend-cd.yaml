@@ -29,6 +29,7 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pipenv'
+          cache-dependency-path: starter/backend/Pipfile.lock
 
       - name: Install Pipenv & Dependencies
         run: |
@@ -53,6 +54,7 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pipenv'
+          cache-dependency-path: starter/backend/Pipfile.lock
 
       - name: Install Pipenv & Dependencies
         run: |
@@ -79,9 +81,9 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID || secrets['AWS_ACCESS_KEY_ID'] }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY || secrets['AWS_ SECRET _ACCESS _KEY'] || secrets['AWS_ SECRET_ACCESS_KEY'] || secrets['AWS_SECRET _ACCESS_KEY'] || secrets['AWS_ SECRET _ACCESS_KEY'] || secrets['AWS_SECRET_ACCESS_KEY '] }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN || secrets['AWS_SESSION_TOKEN'] || '' }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
@@ -117,4 +119,3 @@ jobs:
           cd k8s
           kustomize edit set image backend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           kustomize build | kubectl apply -f -
-
