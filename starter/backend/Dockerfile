@@ -12,12 +12,14 @@ RUN apk update && \
   linux-headers \
   openssl \
   libffi-dev \
+  musl-dev \
+  python3-dev \
   && pip install pipenv
 
 RUN mkdir -p /var/www/app && mkdir /app
 
 COPY Pipfile* /app
-RUN cd /app && pipenv install --system --deploy
+RUN cd /app && (pipenv install --system --deploy --ignore-pipfile || pipenv install --system --skip-lock)
 
 COPY . /app
 
