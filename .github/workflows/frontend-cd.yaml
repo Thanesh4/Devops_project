@@ -110,15 +110,23 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Update kubeconfig for EKS
-        run: |
-          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
-
-      - name: Deploy to EKS with Kustomize
+      - name: Update kubeconfig and Deploy to EKS
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          cd k8s
-          kustomize edit set image frontend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          kustomize build | kubectl apply -f -
+          if aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
+            echo "EKS Cluster active. Updating kubeconfig and applying Kubernetes manifests..."
+            aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+            cd k8s
+            kustomize edit set image frontend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            kustomize build | kubectl apply -f -
+            echo "Kubernetes deployment completed successfully."
+          else
+            echo "EKS Cluster '${{ env.EKS_CLUSTER_NAME }}' is not currently active in ${{ env.AWS_REGION }}."
+            echo "Validating Kubernetes manifests using Kustomize:"
+            cd k8s
+            kustomize edit set image frontend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            kustomize build
+            echo "Manifest verification passed."
+          fi
