@@ -1,5 +1,5 @@
 ####################
-# VPC Configuration
+# VPC Configuration (AWS EKS Provisioning)
 ####################
 # Create a VPC
 resource "aws_vpc" "vpc" {
