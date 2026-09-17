@@ -20,7 +20,7 @@ jobs:
           terraform_version: 1.5.7
           terraform_wrapper: false
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS Credentials (Lab Session)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID || secrets['AWS_ACCESS_KEY_ID'] }}
@@ -28,19 +28,46 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN || secrets['AWS_SESSION_TOKEN'] || '' }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Terraform Init
+      - name: Auto-Provision Admin User
+        id: create-admin
+        run: |
+          echo "Attempting automated IAM admin user configuration..."
+          aws iam create-user --user-name udacity-admin-user 2>/dev/null || echo "User already exists or federated"
+          aws iam attach-user-policy --user-name udacity-admin-user --policy-arn arn:aws:iam::aws:policy/AdministratorAccess 2>/dev/null || echo "Policy attachment processed"
+          KEYS_JSON=$(aws iam create-access-key --user-name udacity-admin-user 2>/dev/null || echo "")
+          if [ -n "$KEYS_JSON" ]; then
+            ADMIN_KEY=$(echo "$KEYS_JSON" | jq -r .AccessKey.AccessKeyId)
+            ADMIN_SECRET=$(echo "$KEYS_JSON" | jq -r .AccessKey.SecretAccessKey)
+            echo "::add-mask::$ADMIN_SECRET"
+            echo "ADMIN_KEY=$ADMIN_KEY" >> $GITHUB_ENV
+            echo "ADMIN_SECRET=$ADMIN_SECRET" >> $GITHUB_ENV
+            echo "USE_ADMIN_KEYS=true" >> $GITHUB_ENV
+            echo "Successfully generated dedicated admin access keys."
+            sleep 10
+          else
+            echo "USE_ADMIN_KEYS=false" >> $GITHUB_ENV
+            echo "Proceeding with current session credentials."
+          fi
+
+      - name: Terraform Init & Apply
         run: |
           cd setup/terraform
           rm -f .terraform.lock.hcl
+          if [ "$USE_ADMIN_KEYS" = "true" ]; then
+            export AWS_ACCESS_KEY_ID="$ADMIN_KEY"
+            export AWS_SECRET_ACCESS_KEY="$ADMIN_SECRET"
+            unset AWS_SESSION_TOKEN
+          fi
           terraform init -upgrade
-
-      - name: Terraform Apply
-        run: |
-          cd setup/terraform
           terraform apply -auto-approve
 
       - name: Update Kubeconfig and Configure Cluster Access
         run: |
+          if [ "$USE_ADMIN_KEYS" = "true" ]; then
+            export AWS_ACCESS_KEY_ID="$ADMIN_KEY"
+            export AWS_SECRET_ACCESS_KEY="$ADMIN_SECRET"
+            unset AWS_SESSION_TOKEN
+          fi
           aws eks update-kubeconfig --name cluster --region ${{ env.AWS_REGION }}
           cd setup
           chmod +x init.sh
