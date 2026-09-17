@@ -1,11 +1,12 @@
 name: Frontend Continuous Integration
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main
-    paths:
-      - 'starter/frontend/**'
   workflow_dispatch:
 
 defaults:
