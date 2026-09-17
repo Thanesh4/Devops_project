@@ -90,11 +90,6 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Ensure ECR Repository Exists
-        run: |
-          aws ecr describe-repositories --repository-names $ECR_REPOSITORY --region ${{ env.AWS_REGION }} || \
-          aws ecr create-repository --repository-name $ECR_REPOSITORY --region ${{ env.AWS_REGION }}
-
       - name: Build Docker Image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -112,33 +107,26 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Update kubeconfig and Deploy to EKS
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Deploy to EKS with Kustomize
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          if aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
-            echo "EKS Cluster active. Updating kubeconfig and applying Kubernetes manifests..."
-            aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
-            cd k8s
-            kustomize edit set image backend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-            kustomize build | kubectl apply -f -
-            echo "Kubernetes deployment completed successfully."
-          else
-            echo "EKS Cluster '${{ env.EKS_CLUSTER_NAME }}' is not currently active in ${{ env.AWS_REGION }}."
-            echo "Validating Kubernetes manifests using Kustomize:"
-            cd k8s
-            kustomize edit set image backend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-            echo "Manifest verification passed."
-          fi
+          cd k8s
+          kustomize edit set image backend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          kustomize build | kubectl apply -f -
 
       - name: Verify Kubernetes deployment
         run: |
           kubectl rollout status deployment/backend --timeout=180s || true
           echo "----- Logging - kubectl get all ---- "
-          kubectl get all || true
+          kubectl get all
           echo "----- Logging - kubectl describe deploy ----- "
-          kubectl describe deploy backend || true
+          kubectl describe deploy backend
 
       - name: Verify Backend ECR image
         run: |

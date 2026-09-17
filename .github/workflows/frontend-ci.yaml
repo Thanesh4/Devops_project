@@ -61,9 +61,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.x
+          cache: 'npm'
+          cache-dependency-path: starter/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test
+        run: CI=true npm run test
+
       - name: Build Docker Image
         env:
           REACT_APP_MOVIE_API_URL: http://localhost:5000
         run: |
           docker build --build-arg=REACT_APP_MOVIE_API_URL=$REACT_APP_MOVIE_API_URL --tag mp-frontend:latest .
-
