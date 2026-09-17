@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'starter/frontend/**'
   workflow_dispatch:
 
 env:
@@ -86,25 +88,23 @@ jobs:
 
       - name: Update kubeconfig for EKS
         run: |
-          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} || echo "EKS cluster not active yet in this session."
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
       - name: Build Docker Image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          BACKEND_HOST=""
-          if kubectl get svc backend >/dev/null 2>&1; then
-            BACKEND_HOST=$(kubectl get svc backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-            if [ -z "$BACKEND_HOST" ]; then
-              BACKEND_HOST=$(kubectl get svc backend -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
-            fi
+          BACKEND_HOST=$(kubectl get svc backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -z "$BACKEND_HOST" ]; then
+            BACKEND_HOST=$(kubectl get svc backend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           fi
           if [ -z "$BACKEND_HOST" ]; then
-            BACKEND_HOST="backend.default.svc.cluster.local:5000"
+            echo "Error: Could not retrieve Backend LoadBalancer hostname or IP!"
+            exit 1
           fi
           REACT_APP_MOVIE_API_URL="http://${BACKEND_HOST}"
-          echo "Setting REACT_APP_MOVIE_API_URL to: $REACT_APP_MOVIE_API_URL"
+          echo "Discovered Backend LoadBalancer URL: $REACT_APP_MOVIE_API_URL"
           docker build \
             --build-arg REACT_APP_MOVIE_API_URL=$REACT_APP_MOVIE_API_URL \
             --tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
@@ -125,26 +125,17 @@ jobs:
         run: |
           cd k8s
           kustomize edit set image frontend=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          if kubectl get svc >/dev/null 2>&1; then
-            kustomize build | kubectl apply -f -
-          else
-            echo "EKS cluster unreachable, rendered manifest:"
-            kustomize build
-          fi
+          kustomize build | kubectl apply -f -
 
       - name: Verify Kubernetes deployment
         run: |
-          if kubectl get svc >/dev/null 2>&1; then
-            kubectl rollout status deployment/frontend --timeout=180s || true
-            echo "----- Logging - kubectl get all ---- "
-            kubectl get all || true
-            echo "----- Logging - kubectl describe deploy ----- "
-            kubectl describe deploy frontend || true
-          else
-            echo "Verification logged: Kubernetes cluster pending/offline."
-          fi
+          kubectl rollout status deployment/frontend --timeout=300s
+          echo "----- Logging - kubectl get all ---- "
+          kubectl get all
+          echo "----- Logging - kubectl describe deploy ----- "
+          kubectl describe deploy frontend
 
       - name: Verify Frontend ECR image
         run: |
           echo "----- Logging - Frontend ECR Image Details ----- "
-          AWS_PAGER="" aws ecr describe-images --repository-name frontend --region us-east-1 --query 'sort_by(imageDetails,&imagePushedAt)[-1].{Tags:imageTags,Digest:imageDigest,PushedAt:imagePushedAt}' --output table || echo "ECR image verification complete."
+          AWS_PAGER="" aws ecr describe-images --repository-name frontend --region ${{ env.AWS_REGION }} --query 'sort_by(imageDetails,&imagePushedAt)[-1].{Tags:imageTags,Digest:imageDigest,PushedAt:imagePushedAt}' --output table
